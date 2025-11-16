@@ -1,139 +1,146 @@
-//@version=5
-strategy("1BTCUSDT High Win Rate 1min w/ Visual Filters", 
-     overlay=true,
-     default_qty_type=strategy.percent_of_equity, 
-     default_qty_value=1, 
-     initial_capital=100, 
-     currency=currency.USD,
-     pyramiding=1,
-     commission_type=strategy.commission.percent,
-     commission_value=0.0,
-     calc_on_every_tick=false)
+import os
+import logging
+from flask import Flask, request, jsonify
+import ccxt
 
-// ================== KRAKEN ALERT SETTINGS ==================
-send_order_alerts   = input.bool(true, "Send alerts to Kraken")
-product_id_input    = input.string("BTC-USD", "Exchange Pair Symbol")
-alert_amount        = input.float(10.0, "Order Amount (USD)", minval=1, step=1)
+logging.basicConfig(level=logging.INFO)
 
-// Kraken-friendly message format (key:value pairs)
-long_msg  = 'symbol: ' + product_id_input + '; action: buy; amount: ' + str.tostring(alert_amount)
-short_msg = 'symbol: ' + product_id_input + '; action: sell; amount: ' + str.tostring(alert_amount)
+ALERT_SECRET = os.environ.get("ALERT_SECRET")  # token expected in URL /webhook/<token>
+KRAKEN_API_KEY = os.environ.get("KRAKEN_API_KEY")
+KRAKEN_API_SECRET = os.environ.get("KRAKEN_API_SECRET")
 
-// ================== INPUTS ==================
-RiskPct       = input.float(1.0, "Risk % per trade", step=0.1, minval=0.1)
-atrPeriod     = input.int(14, "ATR period")
-atrMult       = input.float(1.0, "ATR multiplier")
-minStopPips   = input.float(0.5, "Min stop")
-rr            = input.float(1.2, "Take-profit (R multiple)")
-useTrail      = input.bool(true, "Enable trailing")
-trailATRmult  = input.float(1.0, "Trailing distance = ATR ×")
-showRTrades   = input.bool(true, "Show per-trade R-multiples")
-showPanel     = input.bool(true, "Show Stats Panel")
+# Create ccxt Kraken instance if keys provided
+exchange = None
+if KRAKEN_API_KEY and KRAKEN_API_SECRET:
+    exchange = ccxt.kraken({
+        "apiKey": KRAKEN_API_KEY,
+        "secret": KRAKEN_API_SECRET,
+        "enableRateLimit": True,
+    })
 
-// ================== INDICATORS ==================
-emaFast = ta.ema(close, 9)
-emaSlow = ta.ema(close, 21)
-atrValue = ta.atr(atrPeriod)
-atrMin = ta.lowest(atrValue, 14)
+app = Flask(__name__)
 
-// ================== SIGNALS ==================
-candleBull = close > open
-candleBear = close < open
-volatilityOK = atrValue > atrMin * 1.1
 
-longSignal  = ta.crossover(emaFast, emaSlow) and candleBull and volatilityOK
-shortSignal = ta.crossunder(emaFast, emaSlow) and candleBear and volatilityOK
+def map_symbol_to_ccxt(symbol_raw):
+    """
+    Map incoming symbol like "BTC-USD" or "BTCUSD" to ccxt format "BTC/USD".
+    If exchange is available, prefer a symbol that exists on Kraken markets.
+    """
+    if not symbol_raw:
+        return None
+    s = symbol_raw.upper().replace("-", "").replace(":", "").replace("/", "").strip()
+    # Try detect base and quote
+    # Common quote = USD (could be XBT vs BTC on Kraken)
+    base = None
+    if s.startswith("BTC"):
+        base = "BTC"
+    elif s.startswith("XBT"):
+        base = "XBT"
+    else:
+        # fallback: take first 3 letters as base
+        base = s[:3]
 
-// ================== TRADE FUNCTION ==================
-f_enterTrade(dir) =>
-    float stop = na
-    float tp = na
-    float trail = na
-    float qty = 0.0
-    float riskPerUnit = na
+    preferred = f"{base}/USD"
+    if exchange:
+        try:
+            markets = exchange.load_markets()
+            if preferred in markets:
+                return preferred
+            # fallback to XBT/USD if preferred not present and base was BTC
+            if base == "BTC":
+                alt = "XBT/USD"
+                if alt in markets:
+                    return alt
+            # fallback to any market that contains base
+            for m in markets:
+                if m.startswith(base + "/"):
+                    return m
+        except Exception:
+            # if load_markets fails, return preferred
+            pass
+    return preferred
 
-    if dir == strategy.long
-        stop := close - math.max(atrValue * atrMult, minStopPips)
-        riskPerUnit := close - stop
-        tp := close + rr * riskPerUnit
-    else
-        stop := close + math.max(atrValue * atrMult, minStopPips)
-        riskPerUnit := stop - close
-        tp := close - rr * riskPerUnit
 
-    if not na(riskPerUnit) and riskPerUnit > 0
-        riskValue = strategy.equity * RiskPct / 100.0
-        qty := riskValue / riskPerUnit
+@app.route("/webhook/<token>", methods=["POST"])
+def webhook(token):
+    # Simple token check
+    if ALERT_SECRET and token != ALERT_SECRET:
+        logging.warning("Unauthorized token: %s", token)
+        return jsonify({"error": "unauthorized"}), 403
 
-    if useTrail
-        trail := trailATRmult * atrValue
+    raw = request.get_data(as_text=True) or ""
+    logging.info("Raw body: %s", raw)
 
-    if qty > 0
-        entryName = dir==strategy.long ? "Long" : "Short"
-        alertMsg  = dir==strategy.long ? long_msg : short_msg
-        
-        strategy.entry(entryName, dir, qty=qty, alert_message=(send_order_alerts ? alertMsg : ""))
+    payload = None
+    try:
+        payload = request.get_json(silent=True)
+    except Exception:
+        payload = None
 
-        if not na(trail) and trail > 0
-            strategy.exit(entryName + " Exit", from_entry=entryName, stop=stop, limit=tp, trail_offset=trail)
-        else
-            strategy.exit(entryName + " Exit", from_entry=entryName, stop=stop, limit=tp)
+    msg = raw
+    if isinstance(payload, dict):
+        # try common keys
+        for k in ("message", "msg", "alert_message", "data", "text"):
+            if k in payload:
+                msg = str(payload[k])
+                break
 
-    [qty, stop, tp, riskPerUnit, trail]
+    # parse key:value pairs like "symbol: BTC-USD; action: buy; amount: 10"
+    params = {}
+    for part in [p.strip() for p in msg.split(";") if p.strip()]:
+        if ":" in part:
+            k, v = part.split(":", 1)
+            params[k.strip().lower()] = v.strip()
 
-// ================== EXECUTION ==================
-if barstate.isconfirmed and longSignal
-    f_enterTrade(strategy.long)
-    alert(long_msg, alert.freq_once_per_bar_close)
+    symbol_raw = params.get("symbol") or params.get("product") or params.get("pair")
+    action = (params.get("action") or "buy").lower()
+    try:
+        amount_usd = float(params.get("amount") or params.get("amt") or 0)
+    except Exception:
+        amount_usd = 0.0
 
-if barstate.isconfirmed and shortSignal
-    f_enterTrade(strategy.short)
-    alert(short_msg, alert.freq_once_per_bar_close)
+    if not symbol_raw or amount_usd <= 0:
+        logging.error("Invalid payload: symbol=%s amount=%s", symbol_raw, amount_usd)
+        return jsonify({"error": "bad payload", "body": msg}), 400
 
-// ================== VISUAL FILTERS ==================
-plotshape(volatilityOK, title="Volatility OK", style=shape.triangleup, color=color.yellow, location=location.bottom, size=size.tiny)
-plotshape(candleBull and volatilityOK, title="Strong Bull Candle", style=shape.triangleup, color=color.green, location=location.belowbar, size=size.small)
-plotshape(candleBear and volatilityOK, title="Strong Bear Candle", style=shape.triangledown, color=color.red, location=location.abovebar, size=size.small)
+    ccxt_symbol = map_symbol_to_ccxt(symbol_raw)
+    logging.info("Mapped symbol %s -> %s", symbol_raw, ccxt_symbol)
 
-plotshape(longSignal, title="Long Entry", style=shape.labelup, location=location.belowbar, color=color.green, text="LONG")
-plotshape(shortSignal, title="Short Entry", style=shape.labeldown, location=location.abovebar, color=color.red, text="SHORT")
+    if not exchange:
+        logging.info("No Kraken API keys configured — dry run.")
+        return (
+            jsonify(
+                {
+                    "status": "received",
+                    "symbol": ccxt_symbol,
+                    "action": action,
+                    "amount_usd": amount_usd,
+                    "note": "PAPER RUN - no API keys configured",
+                }
+            ),
+            200,
+        )
 
-// ================== R-MULTIPLES ==================
-var float tradeRisk = na
-var float lastR = na
-var float sumR = 0
-var int tradeCount = 0
+    try:
+        ticker = exchange.fetch_ticker(ccxt_symbol)
+        price = ticker.get("last") or ticker.get("close")
+        if not price:
+            raise Exception("Could not get price for " + ccxt_symbol)
+        # compute quantity in base currency
+        qty = round(amount_usd / price, 8)  # adjust precision as required
 
-if strategy.closedtrades > tradeCount
-    tradeCount += 1
-    pl = strategy.closedtrades.profit(strategy.closedtrades - 1)
-    if not na(tradeRisk) and tradeRisk > 0
-        lastR := pl / tradeRisk
-        sumR += lastR
-        if showRTrades and not na(lastR)
-            label.new(bar_index, close, text="R=" + str.tostring(lastR,"#.##"), 
-                      style=(lastR < 0 ? label.style_label_down : label.style_label_up), 
-                      color=(lastR < 0 ? color.new(color.red,70) : color.new(color.green,70)), 
-                      textcolor=color.white)
+        side = "buy" if action.startswith("buy") else "sell"
+        logging.info("Placing MARKET %s order for %s %s (USD %s @ %s)", side, qty, ccxt_symbol, amount_usd, price)
 
-// ================== PLOTS ==================
-plot(emaFast, color=color.yellow, title="EMA Fast")
-plot(emaSlow, color=color.orange, title="EMA Slow")
-plot(strategy.equity, "Equity Curve", color=color.green, linewidth=2)
+        order = exchange.create_market_order(ccxt_symbol, side, qty)
+        logging.info("Order result: %s", order)
+        return jsonify({"status": "ok", "order": order}), 200
 
-// ================== STATS PANEL ==================
-if barstate.islast and showPanel
-    winRate = strategy.closedtrades>0 ? (strategy.wintrades/strategy.closedtrades)*100 : na
-    pf = strategy.grossloss!=0 ? strategy.grossprofit/-strategy.grossloss : na
-    dd = strategy.max_drawdown
-    netProfit = strategy.netprofit
-    trades = strategy.closedtrades
-    avgR = tradeCount>0 ? sumR/tradeCount : na
+    except Exception as e:
+        logging.exception("Order placement failed")
+        return jsonify({"error": str(e)}), 500
 
-    var table stats = table.new(position.top_right, 1, 6, border_width=1)
-    table.cell(stats, 0,0,"📊 Stats", text_color=color.white, bgcolor=color.black)
-    table.cell(stats, 0,1,"Win Rate: "+str.tostring(winRate,"#.##")+"%", text_color=color.lime)
-    table.cell(stats, 0,2,"PF: "+str.tostring(pf,"#.##"), text_color=color.aqua)
-    table.cell(stats, 0,3,"Max DD: "+str.tostring(dd,"#.##"), text_color=color.orange)
-    table.cell(stats, 0,4,"Net Profit: "+str.tostring(netProfit,"#.##"), text_color=color.green)
-    table.cell(stats, 0,5,"Trades: "+str.tostring(trades), text_color=color.yellow)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
